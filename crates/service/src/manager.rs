@@ -1,3 +1,7 @@
+// Fires inside diesel's `QueryableByName` expansion for `Stats`, not on code
+// written here, and an item-level allow does not reach derive output.
+#![allow(clippy::redundant_field_names)]
+
 use super::runner::PulseRunner;
 
 use crate::settings::triggers::Trigger;
@@ -48,8 +52,6 @@ diesel::define_sql_function! {
 }
 
 /// Represents the service statistics.
-// The lint fires inside diesel's `QueryableByName` expansion, not this code.
-#[allow(clippy::redundant_field_names)]
 #[derive(Clone, Serialize, QueryableByName)]
 pub struct Stats {
     /// The total number of events.
