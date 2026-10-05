@@ -116,6 +116,13 @@ pub struct ScanEvent {
 
     /// The time the scan event can be processed.
     pub can_process: NaiveDateTime,
+
+    /// The time a target confirmed the file is present, e.g. visible in a
+    /// Plex library. Only set by targets that verify their work.
+    pub verified_at: Option<NaiveDateTime>,
+    /// Why the most recent attempt did not succeed. Kept after a later
+    /// success so the history of a slow file stays visible.
+    pub last_error: Option<String>,
 }
 
 impl ScanEvent {

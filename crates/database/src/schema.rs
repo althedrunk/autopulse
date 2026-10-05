@@ -17,6 +17,8 @@ diesel::table! {
         created_at -> Timestamp,
         updated_at -> Timestamp,
         can_process -> Timestamp,
+        verified_at -> Nullable<Timestamp>,
+        last_error -> Nullable<Text>,
     }
 }
 

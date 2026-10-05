@@ -4,7 +4,7 @@ use actix_web::{
     web::{Data, Path, Query},
     HttpRequest, Result,
 };
-use autopulse_service::manager::PulseManager;
+use autopulse_service::manager::{PulseManager, VERIFIED_FILTER};
 use maud::{html, Markup};
 use serde::Deserialize;
 
@@ -153,7 +153,7 @@ fn stats_cards(
     status: Option<&str>,
     search: Option<&str>,
 ) -> Markup {
-    let cards: [(_, i64, _, icondata::Icon, Option<&str>); 5] = [
+    let cards: [(_, i64, _, icondata::Icon, Option<&str>); 6] = [
         (
             "Pending",
             stats.pending,
@@ -181,6 +181,13 @@ fn stats_cards(
             "Failed to process",
             icondata::LuCircleAlert,
             Some("failed"),
+        ),
+        (
+            "Verified",
+            stats.verified,
+            "Confirmed in library",
+            icondata::LuBadgeCheck,
+            Some(VERIFIED_FILTER),
         ),
         (
             "Total",

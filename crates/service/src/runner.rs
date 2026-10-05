@@ -12,8 +12,25 @@ use autopulse_database::{
 };
 use autopulse_utils::sha256checksum;
 use autopulse_utils::sify;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, info_span, warn, Instrument};
+
+/// Seconds to wait before retrying an event that has failed `failed_times`
+/// times: doubles after each failure, optionally capped by
+/// [`opts.max_retry_delay`](crate::settings::opts::Opts::max_retry_delay).
+fn retry_delay(failed_times: i32, max_retry_delay: Option<u64>) -> i64 {
+    // A year is far beyond any useful retry and keeps chrono in range.
+    const CEILING: i64 = 365 * 24 * 60 * 60;
+
+    let exponent = u32::try_from(failed_times.saturating_add(1)).unwrap_or(0);
+    let delay = 2_i64.checked_pow(exponent).unwrap_or(CEILING).min(CEILING);
+
+    match max_retry_delay {
+        Some(max) => delay.min(i64::try_from(max).unwrap_or(CEILING)),
+        None => delay,
+    }
+}
 
 enum FileCheckResult {
     NotFound,
@@ -272,6 +289,9 @@ impl<'a> PulseRunner<'a> {
     ) -> anyhow::Result<(Vec<ScanEvent>, Vec<ScanEvent>, Vec<ScanEvent>)> {
         let previous = evs.to_vec();
         let mut failed_ids = vec![];
+        let mut verified_ids = HashSet::new();
+        // Why each failed event failed, for the UI and retry decisions.
+        let mut notes: HashMap<String, String> = HashMap::new();
 
         let trigger_settings = &self.manager.settings.triggers;
 
@@ -292,7 +312,7 @@ impl<'a> PulseRunner<'a> {
             }
 
             let res = target
-                .process(
+                .process_outcome(
                     // TODO: Somehow clean this up
                     evs.iter()
                         .map(|x| &**x)
@@ -303,17 +323,30 @@ impl<'a> PulseRunner<'a> {
                 .await;
 
             match res {
-                Ok(s) => {
+                Ok(outcome) => {
                     for ev in evs {
-                        if s.contains(&ev.id) {
+                        if outcome.verified.contains(&ev.id) {
+                            verified_ids.insert(ev.id.clone());
+                        }
+
+                        if outcome.succeeded.contains(&ev.id) {
                             ev.add_target_hit(name);
                         } else {
                             failed_ids.push(ev.id.clone());
+
+                            let note = outcome
+                                .notes
+                                .get(&ev.id)
+                                .map_or("did not report success", String::as_str);
+                            notes.insert(ev.id.clone(), format!("{name}: {note}"));
                         }
                     }
                 }
                 Err(e) => {
-                    failed_ids.extend(evs.iter().map(|x| x.id.clone()));
+                    for ev in &evs {
+                        failed_ids.push(ev.id.clone());
+                        notes.insert(ev.id.clone(), format!("{name}: {e:#}"));
+                    }
 
                     error!("failed to process target '{}': {:?}", name, e);
                 }
@@ -327,6 +360,14 @@ impl<'a> PulseRunner<'a> {
         for (ev, previous) in evs.iter_mut().zip(previous) {
             ev.updated_at = chrono::Utc::now().naive_utc();
 
+            if verified_ids.contains(&ev.id) && ev.verified_at.is_none() {
+                ev.verified_at = Some(ev.updated_at);
+            }
+
+            if let Some(note) = notes.remove(&ev.id) {
+                ev.last_error = Some(note);
+            }
+
             if failed_ids.contains(&ev.id) {
                 ev.failed_times += 1;
 
@@ -335,7 +376,10 @@ impl<'a> PulseRunner<'a> {
                     ev.next_retry_at = None;
                 } else {
                     let next_retry = chrono::Utc::now().naive_utc()
-                        + chrono::Duration::seconds(2_i64.pow(ev.failed_times as u32 + 1));
+                        + chrono::Duration::seconds(retry_delay(
+                            ev.failed_times,
+                            self.manager.settings.opts.max_retry_delay,
+                        ));
 
                     ev.process_status = ProcessStatus::Retry.into();
                     ev.next_retry_at = Some(next_retry);
@@ -414,5 +458,29 @@ impl<'a> PulseRunner<'a> {
         self.cleanup().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_delay;
+
+    #[test]
+    fn retry_delay_doubles_after_each_failure() {
+        assert_eq!(retry_delay(1, None), 4);
+        assert_eq!(retry_delay(2, None), 8);
+        assert_eq!(retry_delay(3, None), 16);
+    }
+
+    #[test]
+    fn retry_delay_respects_the_configured_cap() {
+        assert_eq!(retry_delay(3, Some(10)), 10);
+        assert_eq!(retry_delay(1, Some(10)), 4);
+    }
+
+    #[test]
+    fn retry_delay_does_not_overflow_on_many_failures() {
+        assert_eq!(retry_delay(100, None), 365 * 24 * 60 * 60);
+        assert_eq!(retry_delay(i32::MAX, Some(600)), 600);
     }
 }

@@ -44,6 +44,11 @@ pub struct Opts {
     /// Maximum retries before giving up (default: 5)
     pub max_retries: i32,
 
+    /// Upper bound in seconds on the wait between retries. The wait doubles
+    /// after each failure (4s, 8s, 16s, ...), so without a cap a high
+    /// `max_retries` leaves days between attempts (default: no cap)
+    pub max_retry_delay: Option<u64>,
+
     /// Default timer wait time (default: 60)
     pub default_timer_wait: u64,
 
@@ -74,6 +79,7 @@ impl Default for Opts {
         Self {
             check_path: false,
             max_retries: 5,
+            max_retry_delay: None,
             default_timer_wait: 60,
             cleanup_days: 10,
             log_file: None,

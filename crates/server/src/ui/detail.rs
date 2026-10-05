@@ -5,7 +5,7 @@ use actix_web::{
     Result,
 };
 use autopulse_database::models::{ProcessStatus, ScanEvent};
-use autopulse_service::manager::PulseManager;
+use autopulse_service::{manager::PulseManager, settings::targets::Target};
 use chrono::NaiveDateTime;
 use maud::{html, Markup, PreEscaped};
 
@@ -65,6 +65,24 @@ pub async fn event_detail(
         "pending"
     };
 
+    // Only show the verification step where it means something: the event
+    // was verified, or a target is configured to verify.
+    let verifying = ev.verified_at.is_some()
+        || manager
+            .settings
+            .targets
+            .values()
+            .any(|target| matches!(target, Target::Plex(plex) if plex.verify));
+    let verify_state = if ev.verified_at.is_some() {
+        "done"
+    } else if status == ProcessStatus::Failed {
+        "error"
+    } else if status == ProcessStatus::Retry {
+        "retry"
+    } else {
+        "pending"
+    };
+
     let body = html! {
         div.detail-live
             hx-ext="sse"
@@ -106,6 +124,10 @@ pub async fn event_detail(
                     (pipeline_step("Found", found_state))
                     span.detail__pipe-seg .is-dim[!found_passed] {}
                     (pipeline_step("Processed", proc_state))
+                    @if verifying {
+                        span.detail__pipe-seg .is-dim[ev.verified_at.is_none()] {}
+                        (pipeline_step("Verified", verify_state))
+                    }
                 }
 
                 div.detail__cards {
@@ -134,6 +156,12 @@ pub async fn event_detail(
                                 }
                             }))
                             (kv("Failed times", html! { (ev.failed_times) }))
+                            (kv("Last issue", html! {
+                                @match &ev.last_error {
+                                    Some(e) => span.detail__issue { (e) },
+                                    None => span.dim { "\u{2014}" },
+                                }
+                            }))
                             (kv("Targets hit", html! {
                                 @if targets.is_empty() {
                                     span.dim { "\u{2014}" }
@@ -154,6 +182,7 @@ pub async fn event_detail(
                             (kv_ts("Updated", &Some(ev.updated_at)))
                             (kv_ts("Found at", &ev.found_at))
                             (kv_ts("Processed at", &ev.processed_at))
+                            (kv_ts("Verified at", &ev.verified_at))
                             (kv_ts("Eligible at", &Some(ev.can_process)))
                             (kv_ts("Next retry at", &ev.next_retry_at))
                         }

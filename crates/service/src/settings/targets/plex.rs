@@ -1,7 +1,7 @@
 use super::{Request, RequestBuilderPerform};
 use crate::settings::path_filter::PathFilter;
 use crate::settings::rewrite::Rewrite;
-use crate::settings::targets::TargetProcess;
+use crate::settings::targets::{TargetOutcome, TargetProcess};
 use anyhow::Context;
 use autopulse_database::models::ScanEvent;
 use autopulse_utils::{get_url, RuntimePath};
@@ -34,7 +34,41 @@ pub struct Plex {
     /// HTTP request options
     #[serde(default)]
     pub request: Request,
+    /// Confirm each file shows up in the library after it is scanned, and
+    /// report files that do not as failed so they are retried (default: false).
+    ///
+    /// Plex silently drops a refresh request that arrives while it is already
+    /// scanning the library, so with this enabled scans are sent one folder
+    /// at a time, only once the library is idle, and each is waited on before
+    /// the next. Pair it with `opts.max_retries` and `opts.max_retry_delay`
+    /// to decide how long a missing file keeps being retried.
+    #[serde(default)]
+    pub verify: bool,
+    /// With `verify`, seconds to wait for a scan that is already running to
+    /// finish before sending ours (default: 600)
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u64,
+    /// With `verify`, seconds to wait for our scan to finish before looking
+    /// the files up anyway (default: 900)
+    #[serde(default = "default_scan_timeout")]
+    pub scan_timeout: u64,
 }
+
+const fn default_idle_timeout() -> u64 {
+    600
+}
+
+const fn default_scan_timeout() -> u64 {
+    900
+}
+
+/// How often to poll Plex while waiting on a library scan.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long to watch for a sent scan to start. Small folders can be scanned
+/// between two polls, so a scan that is never seen is not an error: the
+/// library lookup that follows is the real check.
+const SCAN_START_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -80,12 +114,30 @@ struct Location {
 struct Library {
     title: String,
     key: String,
+    /// `movie`, `show`, `artist` or `photo`
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     refreshing: Option<bool>,
     #[serde(rename = "scannedAt")]
     scanned_at: Option<u64>,
     #[serde(rename = "Location")]
     location: Vec<Location>,
 }
+
+/// A library's current scan state, for display.
+#[derive(Serialize, Clone, Debug)]
+pub struct LibraryState {
+    pub title: String,
+    /// `movie`, `show`, `artist` or `photo`
+    pub kind: Option<String>,
+    /// Whether Plex is scanning the library right now; `None` if not reported.
+    pub refreshing: Option<bool>,
+}
+
+/// `(event id, path)` pairs for the files of one folder.
+type FolderFiles = Vec<(String, String)>;
+/// A library and the folders to scan in it, in first-seen order.
+type LibraryPlan = (Library, Vec<(String, FolderFiles)>);
 
 struct LibraryCleanup {
     scanned_at: Option<u64>,
@@ -401,6 +453,325 @@ impl Plex {
         client.get(url).perform().await.map(|_| ())
     }
 
+    /// Plex item type to list for a library, or `None` when items of that
+    /// library cannot be looked up by file.
+    fn item_type(library: &Library) -> Option<&'static str> {
+        match library.kind.as_deref() {
+            Some("movie") => Some("1"),
+            Some("show") => Some("4"),
+            Some("artist") => Some("10"),
+            _ => None,
+        }
+    }
+
+    /// Items in `library` with media at `path`. Plex's `file` filter is a
+    /// substring match, so results are narrowed to exact matches here.
+    ///
+    /// Returns `None` when the library type cannot be looked up by file.
+    async fn find_by_file(
+        &self,
+        library: &Library,
+        path: &str,
+    ) -> anyhow::Result<Option<Vec<Metadata>>> {
+        let Some(item_type) = Self::item_type(library) else {
+            return Ok(None);
+        };
+
+        let client = self.get_client()?;
+        let mut url = get_url(&self.url)?.join(&format!("library/sections/{}/all", library.key))?;
+        url.query_pairs_mut()
+            .append_pair("type", item_type)
+            .append_pair("file", path);
+
+        let res = client.get(url).perform().await?;
+        let lib: LibraryResponse = res.json().await?;
+
+        Ok(Some(
+            lib.media_container
+                .metadata
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|item| {
+                    item.media
+                        .as_deref()
+                        .is_some_and(|media| has_matching_media(media, path))
+                })
+                .collect(),
+        ))
+    }
+
+    async fn is_refreshing(&self, key: &str) -> anyhow::Result<bool> {
+        let library = self
+            .libraries()
+            .await?
+            .into_iter()
+            .find(|library| library.key == key)
+            .context("scanned library no longer exists")?;
+
+        library
+            .refreshing
+            .context("Plex did not report the library scan status")
+    }
+
+    /// Waits for any scan of the library to finish. Returns `false` if it is
+    /// still scanning after `timeout`.
+    async fn wait_until_idle(
+        &self,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let started = tokio::time::Instant::now();
+
+        while self.is_refreshing(key).await? {
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        Ok(true)
+    }
+
+    /// Waits for a scan we just requested to start and finish. Returns
+    /// `false` if it is still running after `timeout`.
+    async fn wait_for_scan(&self, key: &str, timeout: std::time::Duration) -> anyhow::Result<bool> {
+        let started = tokio::time::Instant::now();
+        let mut observed_scan = false;
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            if self.is_refreshing(key).await? {
+                observed_scan = true;
+            } else if observed_scan || started.elapsed() >= SCAN_START_GRACE {
+                return Ok(true);
+            }
+
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+        }
+    }
+
+    async fn scan_folder(&self, library: &Library, directory: &str) -> anyhow::Result<()> {
+        let client = self.get_client()?;
+        let mut url =
+            get_url(&self.url)?.join(&format!("library/sections/{}/refresh", library.key))?;
+        url.query_pairs_mut().append_pair("path", directory);
+
+        client.get(url).perform().await.map(|_| ())
+    }
+
+    async fn empty_trash_now(&self, key: &str) -> anyhow::Result<()> {
+        let client = self.get_client()?;
+        let url = get_url(&self.url)?.join(&format!("library/sections/{key}/emptyTrash"))?;
+        client.put(url).perform().await.map(|_| ())
+    }
+
+    /// Runs `refresh`/`analyze` on items found during verification. Returns
+    /// a failure note if any of them failed.
+    async fn refresh_and_analyze(&self, items: &[Metadata]) -> Option<String> {
+        let mut failures = vec![];
+
+        for item in items {
+            if self.refresh {
+                if let Err(e) = self.refresh_item(&item.key).await {
+                    failures.push(format!("refresh of '{}' failed: {e}", item.key));
+                }
+            }
+            if self.analyze {
+                if let Err(e) = self.analyze_item(&item.key).await {
+                    failures.push(format!("analyze of '{}' failed: {e}", item.key));
+                }
+            }
+        }
+
+        (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
+    /// `verify` mode: scan each affected folder once, one at a time while the
+    /// library is idle, then look every file up in the library.
+    async fn process_verified(&self, evs: &[&ScanEvent]) -> anyhow::Result<TargetOutcome> {
+        let libraries = self.libraries().await.context("failed to get libraries")?;
+        let idle_timeout = std::time::Duration::from_secs(self.idle_timeout);
+        let scan_timeout = std::time::Duration::from_secs(self.scan_timeout);
+
+        // library key -> (library, folder -> [(event id, path)]), keeping
+        // first-seen order so earlier imports are confirmed first.
+        let mut plan: Vec<LibraryPlan> = vec![];
+        let mut notes: HashMap<String, String> = HashMap::new();
+
+        for ev in evs {
+            let ev_path = ev.get_path(&self.rewrite);
+            let matched = self.get_libraries(&libraries, &ev_path);
+
+            if matched.is_empty() {
+                error!("no matching library for {ev_path}");
+                notes.insert(ev.id.clone(), format!("no Plex library contains {ev_path}"));
+                continue;
+            }
+
+            let directory = scan_directory(&ev_path).to_string();
+
+            for library in matched {
+                let index = match plan.iter().position(|(l, _)| l.key == library.key) {
+                    Some(index) => index,
+                    None => {
+                        plan.push((library, vec![]));
+                        plan.len() - 1
+                    }
+                };
+                let folders = &mut plan[index].1;
+                let folder = match folders.iter().position(|(d, _)| *d == directory) {
+                    Some(index) => index,
+                    None => {
+                        folders.push((directory.clone(), vec![]));
+                        folders.len() - 1
+                    }
+                };
+                folders[folder].1.push((ev.id.clone(), ev_path.clone()));
+            }
+        }
+
+        let mut verified: HashSet<String> = HashSet::new();
+        // Present but in a library type that cannot be looked up by file.
+        let mut unverifiable: HashSet<String> = HashSet::new();
+        let mut items: HashMap<String, Vec<Metadata>> = HashMap::new();
+
+        for (library, folders) in &plan {
+            let mut scanned_any = false;
+
+            for (directory, files) in folders {
+                if files.iter().all(|(id, _)| verified.contains(id)) {
+                    continue;
+                }
+
+                if !self.wait_until_idle(&library.key, idle_timeout).await? {
+                    warn!(
+                        "'{}' still scanning after {}s, not scanning '{directory}'",
+                        library.title, self.idle_timeout
+                    );
+                    for (id, _) in files {
+                        notes.insert(
+                            id.clone(),
+                            format!(
+                                "'{}' was still scanning after {}s, so the scan was not sent",
+                                library.title, self.idle_timeout
+                            ),
+                        );
+                    }
+                    continue;
+                }
+
+                if let Err(e) = self.scan_folder(library, directory).await {
+                    error!("failed to scan '{directory}': {e}");
+                    for (id, _) in files {
+                        notes.insert(id.clone(), format!("scan request failed: {e}"));
+                    }
+                    continue;
+                }
+                scanned_any = true;
+
+                let finished = self.wait_for_scan(&library.key, scan_timeout).await?;
+                if !finished {
+                    warn!(
+                        "'{}' still scanning '{directory}' after {}s, checking files anyway",
+                        library.title, self.scan_timeout
+                    );
+                }
+
+                for (id, path) in files {
+                    if verified.contains(id) {
+                        continue;
+                    }
+
+                    match self.find_by_file(library, path).await {
+                        Ok(Some(found)) if !found.is_empty() => {
+                            debug!("verified '{path}' in '{}'", library.title);
+                            verified.insert(id.clone());
+                            notes.remove(id);
+                            items.entry(id.clone()).or_default().extend(found);
+                        }
+                        Ok(Some(_)) => {
+                            let note = if finished {
+                                format!("not in '{}' after the scan finished", library.title)
+                            } else {
+                                format!(
+                                    "not in '{}'; scan still running after {}s",
+                                    library.title, self.scan_timeout
+                                )
+                            };
+                            notes.entry(id.clone()).or_insert(note);
+                        }
+                        Ok(None) => {
+                            unverifiable.insert(id.clone());
+                        }
+                        Err(e) => {
+                            notes
+                                .entry(id.clone())
+                                .or_insert_with(|| format!("library lookup failed: {e:#}"));
+                        }
+                    }
+                }
+            }
+
+            if self.empty_trash && scanned_any {
+                if let Err(e) = self.empty_trash_now(&library.key).await {
+                    error!(
+                        "failed to empty trash for library '{}': {e:#}",
+                        library.title
+                    );
+                }
+            }
+        }
+
+        let mut outcome = TargetOutcome::default();
+
+        for ev in evs {
+            if verified.contains(&ev.id) {
+                outcome.verified.push(ev.id.clone());
+            } else if !unverifiable.contains(&ev.id) {
+                if let Some(note) = notes.remove(&ev.id) {
+                    outcome.notes.insert(ev.id.clone(), note);
+                }
+                continue;
+            }
+
+            if let Some(found) = items.get(&ev.id) {
+                if let Some(note) = self.refresh_and_analyze(found).await {
+                    outcome.notes.insert(ev.id.clone(), note);
+                    continue;
+                }
+            }
+
+            outcome.succeeded.push(ev.id.clone());
+        }
+
+        Ok(outcome)
+    }
+
+    /// Every library on the server with its scan state.
+    pub async fn library_states(&self) -> anyhow::Result<Vec<LibraryState>> {
+        Ok(self
+            .libraries()
+            .await?
+            .into_iter()
+            .map(|library| LibraryState {
+                title: library.title,
+                kind: library.kind,
+                refreshing: library.refreshing,
+            })
+            .collect())
+    }
+
+    pub async fn process_outcome(&self, evs: &[&ScanEvent]) -> anyhow::Result<TargetOutcome> {
+        if self.verify {
+            self.process_verified(evs).await
+        } else {
+            self.process(evs).await.map(TargetOutcome::from_succeeded)
+        }
+    }
+
     async fn empty_library_trash(
         &self,
         key: &str,
@@ -616,6 +987,9 @@ mod tests {
             rewrite: None,
             filter: PathFilter::default(),
             request: Request::default(),
+            verify: false,
+            idle_timeout: default_idle_timeout(),
+            scan_timeout: default_scan_timeout(),
         }
     }
 
@@ -659,11 +1033,15 @@ mod tests {
             rewrite: None,
             filter: PathFilter::default(),
             request: Request::default(),
+            verify: false,
+            idle_timeout: default_idle_timeout(),
+            scan_timeout: default_scan_timeout(),
         };
 
         let libraries = [Library {
             title: "Movies".to_string(),
             key: "library_key_movies".to_string(),
+            kind: None,
             refreshing: None,
             scanned_at: None,
             location: vec![Location {
@@ -679,6 +1057,7 @@ mod tests {
             Library {
                 title: "Movies".to_string(),
                 key: "library_key_movies".to_string(),
+                kind: None,
                 refreshing: None,
                 scanned_at: None,
                 location: vec![Location {
@@ -688,6 +1067,7 @@ mod tests {
             Library {
                 title: "Movies".to_string(),
                 key: "library_key_movies_4k".to_string(),
+                kind: None,
                 refreshing: None,
                 scanned_at: None,
                 location: vec![Location {
@@ -709,6 +1089,7 @@ mod tests {
             Library {
                 title: "Movies".to_string(),
                 key: "movies".to_string(),
+                kind: None,
                 refreshing: None,
                 scanned_at: None,
                 location: vec![Location {
@@ -718,6 +1099,7 @@ mod tests {
             Library {
                 title: "4K Movies".to_string(),
                 key: "movies-4k".to_string(),
+                kind: None,
                 refreshing: None,
                 scanned_at: None,
                 location: vec![Location {

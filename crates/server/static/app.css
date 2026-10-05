@@ -333,7 +333,7 @@ body::before {
   overflow: hidden;
 }
 @media (min-width: 680px)  { .stats { grid-template-columns: repeat(3, 1fr); } }
-@media (min-width: 1040px) { .stats { grid-template-columns: repeat(5, 1fr); } }
+@media (min-width: 1040px) { .stats { grid-template-columns: repeat(6, 1fr); } }
 .stat {
   display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
   padding: 1rem 1.15rem;
@@ -1005,3 +1005,41 @@ body::before {
 
 .events__table-wrap { padding: 0; }
 .events__table-wrap > .events__table-scroll { border-radius: inherit; }
+
+/* ---- verification (fork) ------------------------------------------------ */
+.verified { display: inline-flex; vertical-align: middle; margin-left: 0.4rem; color: var(--complete); }
+.detail__issue { color: var(--retry); font-family: var(--font-mono); font-size: 0.85em; }
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+@media (min-width: 900px) { .status-grid { grid-template-columns: repeat(2, 1fr); } }
+
+.status-counts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.9rem 1.5rem; margin: 0; }
+.status-count__label { color: var(--fg-dim); font-size: 0.8rem; }
+.status-count__value { margin: 0.15rem 0 0; font-size: 1.6rem; font-weight: 600; }
+.status-count__value--complete { color: var(--complete); }
+.status-count__value--retry    { color: var(--retry); }
+.status-count__value--failed   { color: var(--failed); }
+.status-count__value--pending  { color: var(--pending); }
+
+.status-tag {
+  margin-left: 0.6rem; padding: 0.05rem 0.45rem;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--fg-dim); font-size: 0.75rem; font-weight: 500;
+}
+.status-tag--on { color: var(--complete); border-color: rgba(95, 197, 160, 0.35); }
+
+.status-libraries { list-style: none; margin: 0; padding: 0; }
+.status-library {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: 0.45rem 0; border-bottom: 1px solid var(--border);
+}
+.status-library:last-child { border-bottom: 0; }
+
+.status-events { margin-bottom: 1rem; }
+.status-empty, .status-error { margin: 0; padding: 1rem var(--pad-x); color: var(--fg-dim); }
+.status-error { color: var(--failed); }
