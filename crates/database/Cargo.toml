@@ -31,6 +31,8 @@ chrono = { workspace = true }
 diesel = { version = "2.3.6", default-features = false, features = [
     "r2d2",
     "chrono",
+    # scan_events has 17 columns since verified_at/last_error were added.
+    "32-column-tables",
 ] }
 diesel_migrations = { version = "2.3.0", default-features = false }
 
