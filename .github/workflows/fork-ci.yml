@@ -1,0 +1,40 @@
+name: Fork CI
+
+# Fast feedback for work branches in this fork. Upstream's Continuous
+# Integration workflow only runs for main, and does a full release build
+# inside a nix shell; this one uses a debug build and a warm cargo cache.
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, Clippy and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev
+
+      - name: Format Check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy Check
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
