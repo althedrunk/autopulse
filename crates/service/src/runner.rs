@@ -1,5 +1,4 @@
 use crate::manager::PulseManager;
-use crate::settings::targets::TargetProcess;
 use crate::settings::webhooks::EventType;
 use autopulse_database::{
     diesel::{

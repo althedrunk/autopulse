@@ -48,6 +48,8 @@ diesel::define_sql_function! {
 }
 
 /// Represents the service statistics.
+// The lint fires inside diesel's `QueryableByName` expansion, not this code.
+#[allow(clippy::redundant_field_names)]
 #[derive(Clone, Serialize, QueryableByName)]
 pub struct Stats {
     /// The total number of events.
