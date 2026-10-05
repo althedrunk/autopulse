@@ -20,6 +20,8 @@ fn event(path: &str) -> ScanEvent {
         created_at: now,
         updated_at: now,
         can_process: now,
+        verified_at: None,
+        last_error: None,
     }
 }
 

@@ -5,7 +5,7 @@ use actix_web::{
 };
 use actix_web_lab::sse::{self, Sse};
 use autopulse_database::models::ScanEvent;
-use autopulse_service::manager::{EventBroadcast, PulseManager};
+use autopulse_service::manager::{EventBroadcast, PulseManager, VERIFIED_FILTER};
 use serde::Deserialize;
 use std::{convert::Infallible, time::Duration};
 use tokio::sync::mpsc;
@@ -114,8 +114,12 @@ fn build_frames(
 }
 
 fn matches_filter(ev: &ScanEvent, status: Option<&str>, search_lower: Option<&str>) -> bool {
-    if status.is_some_and(|s| ev.process_status != s) {
-        return false;
+    match status {
+        // Not a process status: confirmed by a verifying target.
+        Some(VERIFIED_FILTER) if ev.verified_at.is_none() => return false,
+        Some(VERIFIED_FILTER) | None => {}
+        Some(s) if ev.process_status != s => return false,
+        Some(_) => {}
     }
     if let Some(q) = search_lower {
         if !ev.file_path.to_ascii_lowercase().contains(q) {

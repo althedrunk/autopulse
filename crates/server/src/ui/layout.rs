@@ -42,6 +42,7 @@ pub fn page(ctx: &Ctx<'_>, title: &str, nav: &str, content: Markup) -> Markup {
                         }
                         nav.rail__nav {
                             (rail_link(base, "/ui/events", "Events",   icondata::LuList,            nav == "events"))
+                            (rail_link(base, "/ui/status", "Status",   icondata::LuActivity,        nav == "status"))
                             (rail_link(base, "/ui/add",    "Add scan", icondata::LuPlus,            nav == "add"))
                             (rail_link(base, "/ui/config", "Config",   icondata::LuSlidersHorizontal, nav == "config"))
                         }

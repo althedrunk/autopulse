@@ -2,7 +2,7 @@ use autopulse_database::models::{ProcessStatus, ScanEvent};
 use maud::{html, Markup};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use crate::ui::csrf::HEADER_NAME;
+use crate::ui::{csrf::HEADER_NAME, layout};
 
 pub fn retry_hx_headers() -> String {
     // Null-guard so a missing csrf meta tag doesn't crash retry.
@@ -37,8 +37,20 @@ pub fn event_row(base: &str, ev: &ScanEvent) -> Markup {
             }
             td.cell--status {
                 span.badge .{ "badge--" (status_str) } { (status_str) }
+                @if ev.verified_at.is_some() {
+                    span.verified title="Confirmed in the target library" {
+                        (layout::icon(icondata::LuBadgeCheck, 14))
+                    }
+                }
             }
-            td.cell--failure { "—" }
+            td.cell--failure title=[ev.last_error.as_deref()] {
+                @match (status, ev.last_error.as_deref()) {
+                    (ProcessStatus::Retry | ProcessStatus::Failed, Some(error)) => {
+                        (truncate(error, 80))
+                    }
+                    _ => { "—" }
+                }
+            }
             td.cell--actions {
                 @if matches!(status, ProcessStatus::Failed | ProcessStatus::Retry) {
                     button.btn--retry
@@ -106,4 +118,14 @@ pub fn rows_page(
             (load_more(base, status, search, page + 1))
         }
     }
+}
+
+/// Shortens `text` to at most `max` characters, marking the cut.
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut short = text.chars().take(max).collect::<String>();
+    short.push('\u{2026}');
+    short
 }

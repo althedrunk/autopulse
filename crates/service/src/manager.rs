@@ -1,3 +1,7 @@
+// Fires inside diesel's `QueryableByName` expansion for `Stats`, not on code
+// written here, and an item-level allow does not reach derive output.
+#![allow(clippy::redundant_field_names)]
+
 use super::runner::PulseRunner;
 
 use crate::settings::triggers::Trigger;
@@ -8,6 +12,7 @@ use autopulse_database::diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
 use autopulse_database::diesel::QueryableByName;
 use autopulse_database::schema::scan_events::{
     created_at, event_source, file_path, id, next_retry_at, processed_at, targets_hit, updated_at,
+    verified_at,
 };
 use autopulse_database::{
     conn::{get_conn, AnyConnection, DbPool},
@@ -26,6 +31,10 @@ use tokio::{
     sync::{broadcast, Semaphore},
 };
 use tracing::{debug, error, info, warn};
+
+/// Status filter value selecting events a target confirmed (`verified_at` set)
+/// rather than a [`ProcessStatus`](autopulse_database::models::ProcessStatus).
+pub const VERIFIED_FILTER: &str = "verified";
 
 /// Escape LIKE metacharacters so user input is matched literally.
 fn escape_like_pattern(input: &str) -> String {
@@ -60,6 +69,9 @@ pub struct Stats {
     /// The number of file events that are pending.
     #[diesel(sql_type = BigInt)]
     pub pending: i64,
+    /// The number of file events a target confirmed are present.
+    #[diesel(sql_type = BigInt)]
+    pub verified: i64,
 }
 
 /// One state transition for the in-process broadcast bus.
@@ -140,7 +152,8 @@ impl PulseManager {
     /// `targets_hit` so retry only redoes the targets that actually failed.
     ///
     /// `failed_times` is preserved — manual retry is an impulse, not an
-    /// erasure of history.
+    /// erasure of history. Complete events also clear `verified_at` so a
+    /// verifying target confirms the file again.
     pub async fn reschedule_event(&self, ev_id: &str) -> anyhow::Result<ScanEvent> {
         let ev_id = ev_id.to_owned();
         let updated = self
@@ -169,6 +182,12 @@ impl PulseManager {
                         None::<chrono::NaiveDateTime>,
                     )
                     .otherwise(processed_at)),
+                    // A retried complete event must be confirmed again.
+                    verified_at.eq(diesel::dsl::case_when::<_, _, Nullable<Timestamp>>(
+                        process_status.eq("complete"),
+                        None::<chrono::NaiveDateTime>,
+                    )
+                    .otherwise(verified_at)),
                 ))
                 .get_result::<ScanEvent>(conn)
                 .map_err(|e| match e {
@@ -192,7 +211,8 @@ impl PulseManager {
                     COALESCE(SUM(CASE WHEN process_status = 'complete' THEN 1 ELSE 0 END), 0) as processed, \
                     COALESCE(SUM(CASE WHEN process_status = 'retry' THEN 1 ELSE 0 END), 0) as retrying, \
                     COALESCE(SUM(CASE WHEN process_status = 'failed' THEN 1 ELSE 0 END), 0) as failed, \
-                    COALESCE(SUM(CASE WHEN process_status = 'pending' THEN 1 ELSE 0 END), 0) as pending \
+                    COALESCE(SUM(CASE WHEN process_status = 'pending' THEN 1 ELSE 0 END), 0) as pending, \
+                    COALESCE(SUM(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END), 0) as verified \
                 FROM scan_events",
             )
             .get_result::<Stats>(conn)
@@ -235,8 +255,10 @@ impl PulseManager {
         self.database(move |conn| {
             let mut query = scan_events.into_boxed();
 
-            if let Some(status) = status {
-                query = query.filter(process_status.eq(status));
+            match status.as_deref() {
+                Some(VERIFIED_FILTER) => query = query.filter(verified_at.is_not_null()),
+                Some(status) => query = query.filter(process_status.eq(status.to_string())),
+                None => {}
             }
 
             if let Some(search) = search {
@@ -261,8 +283,10 @@ impl PulseManager {
             let page = page.max(1);
             let mut query = scan_events.into_boxed();
 
-            if let Some(status) = status {
-                query = query.filter(process_status.eq(status));
+            match status.as_deref() {
+                Some(VERIFIED_FILTER) => query = query.filter(verified_at.is_not_null()),
+                Some(status) => query = query.filter(process_status.eq(status.to_string())),
+                None => {}
             }
 
             if limit > 100 {

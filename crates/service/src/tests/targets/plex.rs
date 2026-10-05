@@ -1,4 +1,4 @@
-use crate::settings::targets::{plex::Plex, TargetProcess};
+use crate::settings::targets::{plex::Plex, TargetOutcome, TargetProcess};
 use autopulse_database::models::{FoundStatus, ProcessStatus, ScanEvent};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,8 @@ fn event(id: &str) -> ScanEvent {
         created_at: now,
         updated_at: now,
         can_process: now,
+        verified_at: None,
+        last_error: None,
     }
 }
 
@@ -63,67 +65,97 @@ async fn process_with_optional_responses(
     responses: Vec<(&'static str, u16, Value)>,
     allow_unused: bool,
 ) -> Vec<String> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/plex/", listener.local_addr().unwrap());
-    let expected = responses
-        .iter()
-        .map(|(r, _, _)| r.to_string())
-        .collect::<Vec<_>>();
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let received = Arc::clone(&requests);
-    let server = tokio::spawn(async move {
-        for (_, status, body) in responses {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = Vec::new();
-            loop {
-                let mut chunk = [0; 1024];
-                let count = stream.read(&mut chunk).await.unwrap();
-                assert_ne!(count, 0);
-                buffer.extend_from_slice(&chunk[..count]);
-                if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8(buffer).unwrap();
-            assert!(request
-                .to_ascii_lowercase()
-                .contains("x-plex-token: test-token\r\n"));
-            assert!(request.to_ascii_lowercase().contains("x-test: custom\r\n"));
-            received.lock().unwrap().push(
-                request
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .strip_suffix(" HTTP/1.1")
-                    .unwrap()
-                    .to_string(),
-            );
-            let body = body.to_string();
-            stream.write_all(format!(
-                "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            ).as_bytes()).await.unwrap();
-        }
-    });
+    let mock = MockPlex::start(responses).await;
 
-    let mut config = json!({
-        "url": url, "token": "test-token",
-        "rewrite": {"from": "/downloads", "to": "/media"},
-        "request": {"timeout": 1, "headers": {"X-Test": "custom"}}
-    });
+    let mut config = mock.config();
     if let Some(enabled) = empty_trash {
         config["empty_trash"] = json!(enabled);
     }
     let plex: Plex = serde_json::from_value(config).unwrap();
     let result = plex.process(events).await.unwrap();
-    server.abort();
-    let requests = requests.lock().unwrap();
-    if allow_unused {
-        assert!(expected.starts_with(&requests));
-    } else {
-        assert_eq!(*requests, expected);
-    }
+    mock.finish(allow_unused);
     result
+}
+
+/// A fake Plex that answers each connection with the next canned response
+/// and records the request line, so tests can assert the exact call order.
+struct MockPlex {
+    url: String,
+    expected: Vec<String>,
+    requests: Arc<Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl MockPlex {
+    async fn start(responses: Vec<(&'static str, u16, Value)>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/plex/", listener.local_addr().unwrap());
+        let expected = responses
+            .iter()
+            .map(|(r, _, _)| r.to_string())
+            .collect::<Vec<_>>();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for (_, status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(buffer).unwrap();
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("x-plex-token: test-token\r\n"));
+                assert!(request.to_ascii_lowercase().contains("x-test: custom\r\n"));
+                received.lock().unwrap().push(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .strip_suffix(" HTTP/1.1")
+                        .unwrap()
+                        .to_string(),
+                );
+                let body = body.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+
+        Self {
+            url,
+            expected,
+            requests,
+            server,
+        }
+    }
+
+    fn config(&self) -> Value {
+        json!({
+            "url": self.url, "token": "test-token",
+            "rewrite": {"from": "/downloads", "to": "/media"},
+            "request": {"timeout": 1, "headers": {"X-Test": "custom"}}
+        })
+    }
+
+    fn finish(self, allow_unused: bool) {
+        self.server.abort();
+        let requests = self.requests.lock().unwrap();
+        if allow_unused {
+            assert!(self.expected.starts_with(&requests));
+        } else {
+            assert_eq!(*requests, self.expected);
+        }
+    }
 }
 
 #[tokio::test]
@@ -337,4 +369,195 @@ async fn unmatched_path_does_not_empty_trash() {
     )
     .await
     .is_empty());
+}
+
+// ---- verify mode ----------------------------------------------------------
+
+const LOOKUP_ONE: &str = "GET /plex/library/sections/1/all?type=4&file=%2Fmedia%2FShow%2Fone.mkv";
+const LOOKUP_TWO: &str = "GET /plex/library/sections/1/all?type=4&file=%2Fmedia%2FShow%2Ftwo.mkv";
+
+fn show_libraries(refreshing: bool) -> Value {
+    let mut result = libraries(json!(refreshing));
+    result["MediaContainer"]["Directory"][0]["type"] = json!("show");
+    result
+}
+
+fn found(file: &str) -> Value {
+    json!({"MediaContainer": {"size": 1, "Metadata": [
+        {"key": "/library/metadata/5", "type": "episode",
+         "Media": [{"Part": [{"key": "/library/parts/9", "file": file}]}]}
+    ]}})
+}
+
+fn not_found() -> Value {
+    json!({"MediaContainer": {"size": 0}})
+}
+
+async fn verify(
+    events: &[&ScanEvent],
+    responses: Vec<(&'static str, u16, Value)>,
+    extra: Value,
+) -> TargetOutcome {
+    let mock = MockPlex::start(responses).await;
+
+    let mut config = mock.config();
+    config["verify"] = json!(true);
+    for (key, value) in extra.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    let plex: Plex = serde_json::from_value(config).unwrap();
+    let outcome = plex.process_outcome(events).await.unwrap();
+    mock.finish(false);
+    outcome
+}
+
+#[tokio::test]
+async fn verify_confirms_file_after_scan_finishes() {
+    let ev = event("one");
+    let outcome = verify(
+        &[&ev],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (SCAN, 200, json!({})),
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (LOOKUP_ONE, 200, found("/media/Show/one.mkv")),
+        ],
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(outcome.succeeded, vec!["one"]);
+    assert_eq!(outcome.verified, vec!["one"]);
+    assert!(outcome.notes.is_empty());
+}
+
+#[tokio::test]
+async fn verify_reports_missing_file_for_retry() {
+    let ev = event("one");
+    let outcome = verify(
+        &[&ev],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (SCAN, 200, json!({})),
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (LOOKUP_ONE, 200, not_found()),
+        ],
+        json!({}),
+    )
+    .await;
+
+    assert!(outcome.succeeded.is_empty());
+    assert!(outcome.verified.is_empty());
+    assert_eq!(
+        outcome.notes.get("one").map(String::as_str),
+        Some("not in 'TV' after the scan finished")
+    );
+}
+
+#[tokio::test]
+async fn verify_ignores_files_that_only_share_a_name_prefix() {
+    let ev = event("one");
+    let outcome = verify(
+        &[&ev],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (SCAN, 200, json!({})),
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            // Plex's `file` filter is a substring match.
+            (LOOKUP_ONE, 200, found("/media/Show/one.mkv.part")),
+        ],
+        json!({}),
+    )
+    .await;
+
+    assert!(outcome.succeeded.is_empty());
+}
+
+#[tokio::test]
+async fn verify_scans_a_shared_folder_once() {
+    let first = event("one");
+    let second = event("two");
+    let outcome = verify(
+        &[&first, &second],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (SCAN, 200, json!({})),
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (LOOKUP_ONE, 200, found("/media/Show/one.mkv")),
+            (LOOKUP_TWO, 200, found("/media/Show/two.mkv")),
+        ],
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(outcome.succeeded, vec!["one", "two"]);
+    assert_eq!(outcome.verified, vec!["one", "two"]);
+}
+
+#[tokio::test]
+async fn verify_waits_for_a_running_scan_before_sending() {
+    let ev = event("one");
+    let outcome = verify(
+        &[&ev],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            // Someone else's scan is running; ours would be dropped.
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (SCAN, 200, json!({})),
+            (LIBRARIES, 200, show_libraries(true)),
+            (LIBRARIES, 200, show_libraries(false)),
+            (LOOKUP_ONE, 200, found("/media/Show/one.mkv")),
+        ],
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(outcome.verified, vec!["one"]);
+}
+
+#[tokio::test]
+async fn verify_does_not_send_a_scan_while_library_stays_busy() {
+    let ev = event("one");
+    let outcome = verify(
+        &[&ev],
+        vec![
+            (LIBRARIES, 200, show_libraries(false)),
+            (LIBRARIES, 200, show_libraries(true)),
+        ],
+        json!({"idle_timeout": 0}),
+    )
+    .await;
+
+    assert!(outcome.succeeded.is_empty());
+    assert_eq!(
+        outcome.notes.get("one").map(String::as_str),
+        Some("'TV' was still scanning after 0s, so the scan was not sent")
+    );
+}
+
+#[tokio::test]
+async fn verify_reports_events_outside_every_library() {
+    let mut ev = event("one");
+    ev.file_path = "/unmatched/one.mkv".into();
+    let outcome = verify(
+        &[&ev],
+        vec![(LIBRARIES, 200, show_libraries(false))],
+        json!({}),
+    )
+    .await;
+
+    assert!(outcome.succeeded.is_empty());
+    assert_eq!(
+        outcome.notes.get("one").map(String::as_str),
+        Some("no Plex library contains /unmatched/one.mkv")
+    );
 }

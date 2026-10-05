@@ -265,6 +265,8 @@ impl AnyConnection {
             targets_hit.eq(&updated.targets_hit),
             processed_at.eq(updated.processed_at),
             updated_at.eq(updated.updated_at),
+            verified_at.eq(updated.verified_at),
+            last_error.eq(&updated.last_error),
         ));
         match self {
             #[cfg(feature = "postgres")]

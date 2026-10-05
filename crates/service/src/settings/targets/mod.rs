@@ -334,6 +334,42 @@ pub trait TargetProcess {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<String>>> + Send;
 }
 
+/// Detailed result of a target processing a batch of events.
+///
+/// [`TargetProcess::process`] only reports which events succeeded. Targets
+/// that can confirm their work landed (e.g. Plex, by looking the file up in
+/// the library after scanning) also report which events were verified and
+/// why the others did not succeed.
+#[derive(Debug, Default)]
+pub struct TargetOutcome {
+    /// Ids of events the target handled successfully.
+    pub succeeded: Vec<String>,
+    /// Ids of events the target confirmed are present.
+    pub verified: Vec<String>,
+    /// Why an event did not succeed, keyed by event id.
+    pub notes: HashMap<String, String>,
+}
+
+impl TargetOutcome {
+    pub fn from_succeeded(succeeded: Vec<String>) -> Self {
+        Self {
+            succeeded,
+            ..Default::default()
+        }
+    }
+}
+
+impl Target {
+    /// Like [`TargetProcess::process`], but with verification results and
+    /// failure reasons for targets that provide them.
+    pub async fn process_outcome(&self, evs: &[&ScanEvent]) -> anyhow::Result<TargetOutcome> {
+        match self {
+            Self::Plex(t) => t.process_outcome(evs).await,
+            _ => self.process(evs).await.map(TargetOutcome::from_succeeded),
+        }
+    }
+}
+
 impl TargetProcess for Target {
     async fn process(&self, evs: &[&ScanEvent]) -> anyhow::Result<Vec<String>> {
         match self {

@@ -10,6 +10,7 @@ pub mod events_view;
 pub mod layout;
 pub mod session_key;
 pub mod static_assets;
+pub mod status;
 pub mod stream;
 
 use actix_web::{
@@ -56,5 +57,6 @@ pub fn configure(cfg: &mut ServiceConfig) {
         .service(add::add_preview)
         .service(add::add_page)
         .service(add::add_post)
-        .service(config::config_page);
+        .service(config::config_page)
+        .service(status::status_page);
 }
